@@ -23,6 +23,22 @@ function is_number() {
   fi
 }
 
+# Consultar nomes dos nós existentes no cluster
+echo "Nomes dos nós existentes no cluster:"
+nodes=$(pvesh get /nodes --output-format json | jq -r '.[].node')
+for node in $nodes; do
+  echo "- $node"
+done
+
+# Consultar IDs de VMs e CTs em uso e armazenar em uma variável
+echo "IDs de VMs e CTs em uso:"
+vm_ids=$(pvesh get /cluster/resources --type vm --output-format json | jq -r '.[].vmid')
+vm_ids_array=()
+for vm_id in $vm_ids; do
+  echo "- $vm_id"
+  vm_ids_array+=($vm_id)
+done
+
 # Solicitar a quantidade de VMs a serem criadas
 while true; do
   read -p "Digite a quantidade de VMs a serem criadas: " NUM_VMS
@@ -107,9 +123,8 @@ done
 # Função para verificar se um ID de VM já existe em qualquer nó
 function vm_exists {
   local vmid=$1
-  nodes=$(pvesh get /nodes --output-format json | jq -r '.[].node')
-  for node in $nodes; do
-    if pvesh get /nodes/$node/qemu/$vmid/config &> /dev/null; then
+  for id in "${vm_ids_array[@]}"; do
+    if [ "$id" -eq "$vmid" ]; then
       return 0
     fi
   done
@@ -183,6 +198,7 @@ while [ $CREATED_VMS -lt $NUM_VMS ]; do
   fi
 
   CREATED_VMS=$((CREATED_VMS + 1))
+  START_ID=$((VM_ID + 1))  # Atualizar o ID inicial para o próximo incremento
 done
 
 echo "Criação de VMs concluída com sucesso!"
