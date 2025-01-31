@@ -1,0 +1,227 @@
+#!/bin/bash
+
+# ---------------------------------
+# Script de criação de VMs e configuração de grupos no Proxmox
+# Criado por: Mauricio Jesus
+# Contato: Whatsapp: 69993097575
+# ---------------------------------
+
+# Exibir créditos ao iniciar o script
+echo "---------------------------------"
+echo "Script de criação de VMs e configuração de grupos no Proxmox"
+echo "Criado por: Mauricio Jesus"
+echo "Contato: Whatsapp: 69993097575"
+echo "---------------------------------"
+
+# Função para verificar se a entrada é numérica
+function is_number() {
+  re='^[0-9]+$'
+  if ! [[ $1 =~ $re ]] ; then
+    return 1
+  else
+    return 0
+  fi
+}
+
+# Consultar nomes dos nós existentes no cluster
+echo "Nomes dos nós existentes no cluster:"
+nodes=$(pvesh get /nodes --output-format json | jq -r '.[].node')
+for node in $nodes; do
+  echo "- $node"
+done
+
+# Consultar IDs de VMs e CTs em uso e armazenar em uma variável
+echo "IDs de VMs e CTs em uso:"
+vm_ids=$(pvesh get /cluster/resources --type vm --output-format json | jq -r '.[].vmid')
+vm_ids_array=()
+for vm_id in $vm_ids; do
+  echo "- $vm_id"
+  vm_ids_array+=($vm_id)
+done
+
+# Solicitar a quantidade de VMs a serem criadas
+while true; do
+  read -p "Digite a quantidade de VMs a serem criadas: " NUM_VMS
+  if is_number $NUM_VMS; then
+    break
+  else
+    echo "Por favor, insira um número válido."
+  fi
+done
+
+# Listar templates disponíveis e permitir que o usuário selecione um
+select_template() {
+  echo "Templates disponíveis:"
+  CURRENT_NODE=$(hostname)
+  templates_json=$(pvesh get /cluster/resources --type vm --output-format json)
+  templates=($(echo "$templates_json" | jq -r ".[] | select(.template==1 and .node==\"$CURRENT_NODE\") | \"\(.vmid):\(.name):\(.node)\""))
+  for i in "${!templates[@]}"; do
+    echo "$i) ${templates[$i]}"
+  done
+
+  while true; do
+    read -p "Digite o número do template selecionado: " template_id
+    if is_number $template_id && [ $template_id -ge 0 ] && [ $template_id -lt ${#templates[@]} ]; then
+      TEMPLATE_ID=$(echo ${templates[$template_id]} | awk -F: '{print $1}')
+      TEMPLATE_NODE=$(echo ${templates[$template_id]} | awk -F: '{print $3}')
+      break
+    else
+      echo "Por favor, insira um número válido."
+    fi
+  done
+}
+
+select_template
+
+# Solicitar o ID inicial de sequência de criação
+while true; do
+  read -p "Digite o ID inicial de sequência de criação: " START_ID
+  if is_number $START_ID; then
+    break
+  else
+    echo "Por favor, insira um número válido."
+  fi
+done
+
+# Solicitar o nome base das VMs
+read -p "Digite o nome base das VMs: " VM_NAME_BASE
+# Solicitar o modo de clone (Linked Clone ou Full Clone)
+while true; do
+  echo "Escolha o modo de clone:"
+  echo "0) Linked Clone"
+  echo "1) Full Clone"
+  read -p "Digite o número da opção selecionada: " clone_mode
+  if is_number $clone_mode && { [ "$clone_mode" -eq 0 ] || [ "$clone_mode" -eq 1 ]; }; then
+    if [ "$clone_mode" -eq 0 ]; then
+      FULL=false
+    else
+      FULL=true
+    fi
+    break
+  else
+    echo "Por favor, insira 0 ou 1."
+  fi
+done
+
+# Listar pools disponíveis e permitir que o usuário selecione um
+echo "Pools disponíveis:"
+pools=($(pvesh get /pools --output-format json | jq -r '.[].poolid'))
+for i in "${!pools[@]}"; do
+  echo "$i) ${pools[$i]}"
+done
+
+while true; do
+  read -p "Digite o ID do Resource Pool: " pool_id
+  if is_number $pool_id && [ $pool_id -ge 0 ] && [ $pool_id -lt ${#pools[@]} ]; then
+    POOL_NAME=${pools[$pool_id]}
+    break
+  else
+    echo "Por favor, insira um número válido."
+  fi
+done
+
+# Função para verificar se um ID de VM já existe em qualquer nó
+function vm_exists {
+  local vmid=$1
+  for id in "${vm_ids_array[@]}"; do
+    if [ "$id" -eq "$vmid" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Função para encontrar o próximo ID disponível
+function next_available_vmid {
+  local start_id=$1
+  local vmid=$start_id
+  while vm_exists $vmid; do
+    vmid=$((vmid + 1))
+  done
+  echo $vmid
+}
+
+# Função para copiar as configurações do CD
+function copy_cdrom_settings {
+  local src_vm_id=$1
+  local dst_vm_id=$2
+
+  # Copiar as configurações do CD do template para a nova VM
+  local cdrom_config=$(qm config $src_vm_id | grep -E '^(ide|sata|scsi|virtio)[0-9]+:.*cdrom')
+  if [ -n "$cdrom_config" ]; then
+    local disk_id=$(echo $cdrom_config | awk -F: '{print $1}')
+    local disk_config=$(echo $cdrom_config | awk -F: '{print $2}')
+    qm set $dst_vm_id --$disk_id $disk_config
+  fi
+}
+
+# Função para copiar a configuração de rede
+function copy_network_settings {
+  local src_vm_id=$1
+  local dst_vm_id=$2
+
+  # Copiar as configurações de rede do template para a nova VM
+  local network_configs=$(qm config $src_vm_id | grep -E '^(net[0-9]+):')
+  while IFS= read -r network_config; do
+    local net_id=$(echo $network_config | awk -F: '{print $1}')
+    local net_config=$(echo $network_config | awk -F: '{print $2}')
+    qm set $dst_vm_id --$net_id $net_config
+  done <<< "$network_configs"
+}
+
+# Contador de VMs criadas com sucesso
+CREATED_VMS=0
+
+# Iterar e criar o número especificado de VMs
+while [ $CREATED_VMS -lt $NUM_VMS ]; do
+  # Encontre o próximo ID disponível
+  VM_ID=$(next_available_vmid $START_ID)
+  # Definir o nome da VM
+  VM_NAME="${VM_NAME_BASE}-${VM_ID}"
+
+  # Crie a VM como Linked Clone ou Full Clone do template
+  qm clone $TEMPLATE_ID $VM_ID --name ${VM_NAME} --full $FULL
+
+  # Copiar as configurações do CD do template para a nova VM
+  copy_cdrom_settings $TEMPLATE_ID $VM_ID
+
+  # Copiar as configurações de rede do template para a nova VM
+  copy_network_settings $TEMPLATE_ID $VM_ID
+
+  # Adicionar a VM ao Resource Pool especificado com a opção --allow-move
+  pvesh set /pools/${POOL_NAME} -vms ${VM_ID} --allow-move
+
+  # Verificar se a configuração é válida e se o arquivo de configuração já existe
+  if ! qm config $VM_ID &> /dev/null; then
+    echo "Falha ao configurar a VM $VM_ID"
+    continue
+  fi
+
+  CREATED_VMS=$((CREATED_VMS + 1))
+  START_ID=$((VM_ID + 1))  # Atualizar o ID inicial para o próximo incremento
+done
+
+echo "Criação de VMs concluída com sucesso!"
+
+# Solicitar o nome base do grupo
+read -p "Digite o nome base do grupo: " GROUP_BASE
+
+# Solicitar a quantidade de grupos a serem criados
+while true; do
+  read -p "Digite a quantidade de grupos a serem criados: " NUM_GROUPS
+  if [[ $NUM_GROUPS =~ ^[0-9]+$ ]]; then
+    break
+  else
+    echo "Por favor, insira um número válido."
+  fi
+done
+
+# Criar grupos, usuários e pools com números sequenciais
+for i in $(seq -w 01 $NUM_GROUPS); do
+  GROUP_NAME="${GROUP_BASE}${i}"
+  USER_NAME="${GROUP_BASE}${i}"
+  FIRST_NAME="${GROUP_BASE}"
+  LAST_NAME="${i}"
+  PASSWORD="${USER_NAME}"
+  REALM="pve"
+  POOL
